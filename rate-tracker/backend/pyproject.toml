@@ -1,0 +1,25 @@
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["rates", "config"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["mypy_django_plugin.main"]
+ignore_missing_imports = true
+check_untyped_defs = true
+
+[tool.django-stubs]
+django_settings_module = "config.settings.docker"

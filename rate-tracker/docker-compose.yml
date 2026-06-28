@@ -1,0 +1,100 @@
+x-backend-base: &backend-base
+  build:
+    context: ./backend
+  env_file:
+    - .env
+  volumes:
+    - ./backend:/app
+    - ./data:/app/data
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "6379:6379"
+
+  web:
+    <<: *backend-base
+    command: python manage.py runserver 0.0.0.0:8000
+    environment:
+      RUN_MIGRATIONS_ON_BOOT: "true"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  celery_worker:
+    <<: *backend-base
+    command: celery -A config worker --loglevel=info
+    environment:
+      RUN_MIGRATIONS_ON_BOOT: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
+
+  celery_beat:
+    <<: *backend-base
+    command: celery -A config beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    environment:
+      RUN_MIGRATIONS_ON_BOOT: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ./frontend
+      target: dev
+    env_file:
+      - .env
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    ports:
+      - "3000:3000"
+    depends_on:
+      - web
+
+volumes:
+  postgres_data:
