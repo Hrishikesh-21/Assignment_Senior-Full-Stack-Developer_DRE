@@ -21,3 +21,4 @@ ruff==0.4.8
 isort==5.13.2
 mypy==1.10.0
 django-stubs==5.0.2
+django-cors-headers

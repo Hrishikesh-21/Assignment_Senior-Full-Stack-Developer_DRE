@@ -37,6 +37,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from rates.models import Provider, Rate, RateType, RawIngestion
@@ -138,9 +139,6 @@ class IngestionService:
                 extra={"ingestion_id": ingestion.id, "source_file": source_file},
                 exc_info=True,
             )
-            # Re-raise so the management command exits non-zero and the
-            # Celery task is recorded as failed — "never crash silently"
-            # means errors must be visible to the caller, not swallowed.
             raise
 
         return ingestion
@@ -172,9 +170,6 @@ class IngestionService:
         canonical = normalize_provider_name(raw_name)
         key = canonical.lower()
         if key not in self._provider_cache:
-            # Django's get_or_create() can't take an __iexact lookup and
-            # reliably create with the right value, so do the
-            # case-insensitive lookup explicitly, then create on miss.
             provider = Provider.objects.filter(name__iexact=canonical).first()
             if provider is None:
                 provider = Provider.objects.create(name=canonical)
@@ -228,9 +223,6 @@ class IngestionService:
 
         result.rows_read += len(batch_df)
 
-        # Validate every row first; collect valid ones keyed by natural
-        # key so we can resolve "latest ingestion_ts wins" within this
-        # batch before touching the database.
         latest_by_key: dict[tuple[str, str, date], dict] = {}
 
         for row in batch_df.to_dict(orient="records"):
@@ -275,26 +267,43 @@ class IngestionService:
         self._upsert_rows(latest_by_key, result)
 
     def _upsert_rows(self, latest_by_key: dict, result: IngestionResult) -> None:
+        # Resolve all provider/rate_type FKs first so we can build
+        # exact (provider_id, rate_type_id, effective_date) DB keys.
+        # This lets us query only the rows that could possibly conflict
+        # rather than every row sharing any effective_date in the batch
+        # (the old approach caused O(n²) table scans as the table grew).
+        db_key_to_payload: dict[tuple[int, int, date], dict] = {}
+        for (provider_key, rate_type_key, eff_date), payload in latest_by_key.items():
+            row = payload["row"]
+            provider = self._resolve_provider(str(row["provider"]))
+            rate_type = self._resolve_rate_type(str(row["rate_type"]))
+            db_key_to_payload[(provider.id, rate_type.id, eff_date)] = payload
+
+        if not db_key_to_payload:
+            return
+
+        # Build a precise filter: one (provider_id, rate_type_id, effective_date)
+        # triple per batch entry. PostgreSQL satisfies each term with a direct
+        # index lookup on the unique constraint — result set is bounded at
+        # batch_size rows regardless of how large the table grows.
+        query = Q()
+        for (provider_id, rate_type_id, eff_date) in db_key_to_payload:
+            query |= Q(provider_id=provider_id, rate_type_id=rate_type_id, effective_date=eff_date)
+
         existing_rates = {
             (r.provider_id, r.rate_type_id, r.effective_date): r
-            for r in Rate.objects.filter(
-                effective_date__in={v["eff_date"] for v in latest_by_key.values()}
-            ).select_related("provider", "rate_type")
+            for r in Rate.objects.filter(query)
         }
 
         to_create: list[Rate] = []
         to_update: list[Rate] = []
 
-        for (provider_key, rate_type_key, eff_date), payload in latest_by_key.items():
+        for (provider_id, rate_type_id, eff_date), payload in db_key_to_payload.items():
             row = payload["row"]
-            provider = self._resolve_provider(str(row["provider"]))
-            rate_type = self._resolve_rate_type(str(row["rate_type"]))
-
-            db_key = (provider.id, rate_type.id, eff_date)
             currency = normalize_currency(row.get("currency"))
             rate_value = Decimal(str(row["rate_value"]))
 
-            existing_row = existing_rates.get(db_key)
+            existing_row = existing_rates.get((provider_id, rate_type_id, eff_date))
             if existing_row is not None:
                 existing_row.rate_value = rate_value
                 existing_row.ingestion_timestamp = payload["ingestion_ts"]
@@ -303,6 +312,8 @@ class IngestionService:
                 existing_row.raw_response_id = row.get("raw_response_id")
                 to_update.append(existing_row)
             else:
+                provider = self._resolve_provider(str(row["provider"]))
+                rate_type = self._resolve_rate_type(str(row["rate_type"]))
                 to_create.append(
                     Rate(
                         provider=provider,
@@ -334,3 +345,18 @@ def run_ingestion(source_file: str) -> RawIngestion:
     and the Celery task, so neither has to know about IngestionService
     internals."""
     return IngestionService().run(source_file)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
